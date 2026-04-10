@@ -11,7 +11,7 @@ ton script → corrige.py
 ton fichier → xxxx.ass
 
 2. Ouvre un terminal dans ce dossier
-Méthode rapide :
+- Méthode rapide :
 Va dans ton dossier
 Clique dans la barre d’adresse (en haut)
 Tape : cmd
