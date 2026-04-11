@@ -2,217 +2,222 @@ from pathlib import Path
 import requests
 import sys
 import re
+import json
 
 URL = "http://localhost:1234/v1/chat/completions"
 MODEL = "local-model"  # remplace si besoin
 
 SYSTEM_PROMPT = (
-    "Tu es un correcteur de sous-titres français. "
-    "Corrige les fautes d'orthographe, de grammaire, de conjugaison et de ponctuation. "
-    "Si la phrase est incorrecte, corrige-la entièrement pour qu'elle soit grammaticalement correcte. "
-    "Règle absolue : ne change jamais le sens. "
-    "Ne change jamais le temps verbal, même si une autre version semble plus naturelle. "
-    "Ne change jamais la personne grammaticale. "
-    "Si la phrase est déjà correcte, ne change rien. "
-    "Ne reformule pas si ce n'est pas nécessaire. "
-    "N'ajoute pas d'information. "
-    "Ne supprime pas d'information. "
-    "Si une variante plus écrite est utile, ajoute-la à la fin entre ⟦ et ⟧. "
-    "La suggestion doit garder exactement le même sens. "
-    "N'ajoute pas de suggestion si elle n'est pas utile. "
-    "Ne réponds pas comme un assistant. "
-    "Ne donne aucune explication. "
-    "Ne commente pas. "
-    "Conserve STRICTEMENT les tags ASS comme {\\i1}, {\\b1}, etc. "
-    "Conserve STRICTEMENT les retours de ligne ASS \\N. "
-    "Renvoie uniquement le texte final."
+    "Tu es un relecteur humain de sous-titres français. "
+    "Pour chaque ligne, tu dois produire deux choses : "
+    "1) une correction sûre minimale du texte principal ; "
+    "2) éventuellement une proposition plus naturelle, plus idiomatique ou plus française. "
+    "Règles absolues pour la correction sûre : "
+    "ne jamais changer le sens, "
+    "ne jamais changer le temps verbal sans nécessité, "
+    "ne jamais changer le tutoiement/vouvoiement, "
+    "ne jamais changer la personne grammaticale, "
+    "ne jamais modifier les tags ASS, "
+    "ne jamais modifier les \\N, "
+    "ne jamais supprimer les tirets de dialogue. "
+    "La correction sûre doit rester prudente. "
+    "La proposition QC peut être plus fluide, mais doit garder exactement le même sens. "
+    "Réponds uniquement en JSON valide avec ce format exact : "
+    '{"corrected":"...","suggestion":"...","reason":"..."}'
 )
 
-BAD_PATTERNS = [
-    "veuillez",
-    "merci de",
-    "fournir le texte",
-    "je peux corriger",
-    "je corrigerai",
-    "balises ass",
-    "texte que vous souhaitez",
-    "voici",
-    "here is",
-    "i can help",
-    "je peux vous aider",
-    "corrige cette ligne",
-    "si la phrase est incorrecte",
-]
+def parse_dialogue_line(line: str):
+    if not line.startswith("Dialogue:"):
+        return None
+    parts = line.rstrip("\r\n").split(",", 9)
+    if len(parts) != 10:
+        return None
+    return parts
 
-FORBIDDEN_PHRASES = [
-    "je vais ",
-    "je veux ",
-    "je suis en train de ",
-    "j'ai ça",
-]
-
-def looks_bad(text: str) -> bool:
-    low = text.lower()
-    return any(p in low for p in BAD_PATTERNS)
-
-def forbidden_output(text: str) -> bool:
-    low = text.lower()
-    return any(p in low for p in FORBIDDEN_PHRASES)
-
-def suspicious_output(corrected: str) -> bool:
-    low = corrected.lower()
-    bad_chunks = [
-        "qu'me",
-        "\\N{",
-        "{non",
-        "{oui",
-        "⟦{",
-        "}⟧",
-    ]
-    return any(x in low for x in bad_chunks)
-
-def extract_ass_tags(text: str):
+def extract_tags(text: str):
     return re.findall(r"\{.*?\}", text)
 
-def tags_broken(original: str, corrected: str) -> bool:
-    return extract_ass_tags(original) != extract_ass_tags(corrected)
+def strip_tags(text: str):
+    return re.sub(r"\{.*?\}", "", text)
 
-def fix_newlines(text: str) -> str:
-    return text.replace("\r", "").replace("\n", "\\N")
-
-def split_suggestion(text: str):
-    """
-    Sépare la correction principale et la suggestion éventuelle.
-    Format attendu : texte⟦suggestion⟧
-    """
-    m = re.match(r"^(.*?)(?:⟦(.*)⟧)?$", text, flags=re.DOTALL)
-    if not m:
-        return text, None
-    base = (m.group(1) or "").strip()
-    suggestion = m.group(2)
-    if suggestion is not None:
-        suggestion = suggestion.strip()
-        if not suggestion:
-            suggestion = None
-    return base, suggestion
-
-def normalize_for_compare(text: str) -> str:
+def normalize(text: str) -> str:
     text = text.lower()
     text = text.replace("\\N", " ")
     text = re.sub(r"\{.*?\}", "", text)
-    text = re.sub(r"⟦.*?⟧", "", text)
     text = re.sub(r"[^\w\sàâäçéèêëîïôöùûüÿœæ'-]", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-def too_different(original: str, corrected: str) -> bool:
-    o = normalize_for_compare(original)
-    c = normalize_for_compare(corrected)
+def words(text: str):
+    return normalize(text).split()
 
-    o_words = o.split()
-    c_words = c.split()
+def similarity_ratio(a: str, b: str) -> float:
+    wa = set(words(a))
+    wb = set(words(b))
+    if not wa and not wb:
+        return 1.0
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / max(len(wa | wb), 1)
 
-    if not o_words:
-        return False
+def dash_shape(text: str):
+    return [chunk.lstrip().startswith("-") for chunk in text.split("\\N")]
 
-    ratio = len(c_words) / max(len(o_words), 1)
-    if ratio > 1.8 or ratio < 0.55:
+def risky_line(text: str) -> bool:
+    if r"\p1" in text or r"\p2" in text or r"\p3" in text:
         return True
-
-    common = set(o_words) & set(c_words)
-    if len(o_words) >= 4 and len(common) < max(1, len(set(o_words)) // 3):
+    if len(strip_tags(text).strip()) <= 1:
         return True
-
     return False
 
-def tense_shift_suspect(original: str, corrected: str) -> bool:
-    o = normalize_for_compare(original)
-    c = normalize_for_compare(corrected)
+def local_safe_fixes(text: str) -> str:
+    """
+    Corrections ultra sûres uniquement.
+    Zéro transformation risquée.
+    """
 
-    suspicious_pairs = [
-        ("j ai ", ["je vais ", "je veux ", "je suis en train de ", "je "]),
-        ("tu as ", ["tu vas ", "tu veux ", "tu es en train de ", "tu "]),
-        ("il a ", ["il va ", "il veut ", "il est en train de ", "il "]),
-        ("elle a ", ["elle va ", "elle veut ", "elle est en train de ", "elle "]),
-        ("on a ", ["on va ", "on veut ", "on est en train de ", "on "]),
-        ("nous avons ", ["nous allons ", "nous voulons ", "nous sommes en train de ", "nous "]),
-        ("vous avez ", ["vous allez ", "vous voulez ", "vous êtes en train de ", "vous "]),
-        ("ils ont ", ["ils vont ", "ils veulent ", "ils sont en train de ", "ils "]),
-        ("elles ont ", ["elles vont ", "elles veulent ", "elles sont en train de ", "elles "]),
-    ]
-
-    for old, new_list in suspicious_pairs:
-        if old in o:
-            for new in new_list:
-                if new in c and old not in c:
-                    return True
-
-    return False
-
-def pre_fix(text: str) -> str:
     fixes = [
         (r"\bje c\b", "je sais"),
-        (r"\bj[' ]?est\b", "j'ai"),
-        (r"\bj[' ]?e\b", "j'ai"),
         (r"\bjé\b", "j'ai"),
-        (r"\bje est\b", "j'ai"),
-        (r"\bsa va\b", "ça va"),
         (r"\bske\b", "ce que"),
-        (r"\bjcroi\b", "j'crois"),
-        (r"\bquil\b", "qu'il"),
-        (r"\btavai qua\b", "t'avais qu'à"),
         (r"\bc koi\b", "c'est quoi"),
-        (r"\bta dit\b", "t'as dit"),
+        (r"\bsa va\b", "ça va"),
+        (r"\bquil\b", "qu'il"),
     ]
 
-    for pattern, repl in fixes:
-        text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+    for pat, repl in fixes:
+        text = re.sub(pat, repl, text, flags=re.IGNORECASE)
 
-    return text
-
-def fix_infinitive_past(text: str) -> str:
-    """
-    Corrections simples :
-    j'ai manger -> j'ai mangé
-    il a tomber -> il a tombé (ce n'est pas toujours parfait, donc on reste limité)
-    """
+    # participe passé (cas assez safe)
     text = re.sub(
         r"\bj['’]ai ([a-zàâäçéèêëîïôöùûüÿœæ-]+)er\b",
         r"j'ai \1é",
         text,
         flags=re.IGNORECASE,
     )
-    text = re.sub(
-        r"\bt['’]as ([a-zàâäçéèêëîïôöùûüÿœæ-]+)er\b",
-        r"t'as \1é",
-        text,
-        flags=re.IGNORECASE,
+
+    return text
+
+def register_shift(original: str, candidate: str) -> bool:
+    o = f" {normalize(original)} "
+    c = f" {normalize(candidate)} "
+
+    pairs = [
+        (" tu ", " vous "),
+        (" vous ", " tu "),
+        (" te ", " vous "),
+        (" ton ", " votre "),
+        (" ta ", " votre "),
+        (" tes ", " vos "),
+        (" votre ", " ton "),
+        (" vos ", " tes "),
+        (" ne vous ", " ne te "),
+        (" ne te ", " ne vous "),
+        (" pardonnez ", " pardonne "),
+        (" pardonne ", " pardonnez "),
+    ]
+    for a, b in pairs:
+        if a in o and b in c and a not in c:
+            return True
+    return False
+
+def tense_shift(original: str, candidate: str) -> bool:
+    o = normalize(original)
+    c = normalize(candidate)
+
+    suspicious_pairs = [
+        ("je me demande", "je m'étais demandé"),
+        ("je me disais", "je m'étais dit"),
+        ("je commençais", "j'ai commencé"),
+        ("je pense", "j'ai pensé"),
+        ("je finirai", "j'aurai fini"),
+        ("je suis", "j'ai été"),
+        ("je préfère", "j'ai préféré"),
+        ("on devait", "on n'était pas censés"),
+        ("tu veux rentrer", "tu veux entrer"),
+    ]
+    for a, b in suspicious_pairs:
+        if a in o and b in c:
+            return True
+    return False
+
+def broken_output(text: str) -> bool:
+    low = text.lower()
+    bad = [
+        "{\\n}",
+        "{\\N}",
+        "{\\c}",
+        "{\\anm}",
+        "{\\/i1}",
+        "j'ai suis",
+        "quoi que ce soit",
+        "voilà, tard",
+    ]
+    return any(x.lower() in low for x in bad)
+
+def valid_candidate(original: str, candidate: str, strict: bool = True):
+    if not candidate:
+        return False, "empty"
+
+    if extract_tags(original) != extract_tags(candidate):
+        return False, "tags"
+
+    if original.count("\\N") != candidate.count("\\N"):
+        return False, "N"
+
+    if original.endswith("\\N") != candidate.endswith("\\N"):
+        return False, "N_end"
+
+    if dash_shape(original) != dash_shape(candidate):
+        return False, "dash"
+
+    if broken_output(candidate):
+        return False, "broken"
+
+    if register_shift(original, candidate):
+        return False, "register"
+
+    if tense_shift(original, candidate):
+        return False, "tense"
+
+    threshold = 0.60 if strict else 0.42
+    if similarity_ratio(original, candidate) < threshold:
+        return False, "different"
+
+    return True, "ok"
+
+def parse_model_json(raw: str):
+    raw = raw.strip()
+
+    try:
+        data = json.loads(raw)
+        return {
+            "corrected": str(data.get("corrected", "")).strip(),
+            "suggestion": str(data.get("suggestion", "")).strip(),
+            "reason": str(data.get("reason", "")).strip(),
+        }
+    except Exception:
+        pass
+
+    m = re.search(
+        r'\{.*"corrected"\s*:\s*".*?".*"suggestion"\s*:\s*".*?".*"reason"\s*:\s*".*?".*\}',
+        raw,
+        flags=re.DOTALL,
     )
-    return text
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            return {
+                "corrected": str(data.get("corrected", "")).strip(),
+                "suggestion": str(data.get("suggestion", "")).strip(),
+                "reason": str(data.get("reason", "")).strip(),
+            }
+        except Exception:
+            pass
 
-def post_fix(text: str) -> str:
-    text = re.sub(r"\bet les papillon\.\b", "et les papillons.", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bqu['’]me\b", "qu'à me", text, flags=re.IGNORECASE)
-    return text
+    return None
 
-def suggestion_looks_ok(base: str, suggestion: str) -> bool:
-    if not suggestion:
-        return False
-    if suggestion == base:
-        return False
-    if looks_bad(suggestion):
-        return False
-    if forbidden_output(suggestion):
-        return False
-    if suspicious_output(suggestion):
-        return False
-    if suggestion.count("\\N") != base.count("\\N"):
-        return False
-    if extract_ass_tags(base) != extract_ass_tags(suggestion):
-        return False
-    return True
-
-def correct_text(text: str) -> str:
+def call_model(text: str):
     payload = {
         "model": MODEL,
         "messages": [
@@ -220,155 +225,126 @@ def correct_text(text: str) -> str:
             {
                 "role": "user",
                 "content": (
-                    "Corrige cette ligne de sous-titre en français.\n"
-                    "Règles :\n"
-                    "- Si la phrase est fausse, corrige-la complètement\n"
-                    "- Ne change pas le sens\n"
-                    "- Ne change pas le temps verbal\n"
-                    "- Ne change pas la personne grammaticale\n"
-                    "- Si la phrase est déjà correcte, ne change rien\n"
-                    "- Si une suggestion plus écrite est utile, ajoute une seule suggestion entre ⟦ et ⟧\n"
-                    "- La suggestion doit garder exactement le même sens\n"
-                    "- Garde les tags ASS et les \\N\n"
-                    "- Renvoie uniquement le texte final\n\n"
+                    "Analyse cette ligne de sous-titre.\n"
+                    "Consignes :\n"
+                    "- corrected = correction sûre et prudente\n"
+                    "- suggestion = tournure plus naturelle si utile, sinon chaîne vide\n"
+                    "- garde les tags ASS, les \\N et les tirets\n"
+                    "- conserve exactement le sens\n\n"
                     f"{text}"
-                ),
-            },
+                )
+            }
         ],
-        "temperature": 0.0,
+        "temperature": 0.0
     }
 
     r = requests.post(URL, json=payload, timeout=120)
     r.raise_for_status()
-    data = r.json()
-    return data["choices"][0]["message"]["content"].strip()
+    raw = r.json()["choices"][0]["message"]["content"]
+    return parse_model_json(raw)
 
-def parse_dialogue(line: str):
-    if not line.startswith("Dialogue:"):
-        return None
+def make_comment_line(parts, suggestion, reason):
+    comment_parts = parts.copy()
+    comment_parts[0] = "Comment: 0"
+    comment_parts[9] = f"QC: {suggestion}"
+    if reason:
+        comment_parts[9] += f" [{reason}]"
+    return ",".join(comment_parts)
 
-    parts = line.rstrip("\r\n").split(",", 9)
-    if len(parts) != 10:
-        return None
+def process_line(text: str):
+    original = text
 
-    return parts[:9], parts[9]
+    if risky_line(text):
+        return original, None, "ligne spéciale"
+
+    prepared = local_safe_fixes(text)
+
+    result = None
+    try:
+        result = call_model(prepared)
+    except Exception:
+        return original, None, "erreur modèle"
+
+    if result is None:
+        return original, None, "réponse invalide"
+
+    corrected = result["corrected"] or prepared
+    suggestion = result["suggestion"]
+    reason = result["reason"]
+
+    ok_corr, why_corr = valid_candidate(original, corrected, strict=True)
+    if not ok_corr:
+        # on garde éventuellement la pré-correction locale si elle est sûre
+        ok_pre, _ = valid_candidate(original, prepared, strict=True)
+        if ok_pre and prepared != original:
+            corrected = prepared
+        else:
+            corrected = original
+
+    final_suggestion = None
+    if suggestion and suggestion != corrected:
+        ok_sugg, _ = valid_candidate(corrected, suggestion, strict=False)
+        if ok_sugg:
+            final_suggestion = suggestion
+
+    return corrected, final_suggestion, reason
 
 def main():
     if len(sys.argv) < 2:
-        print('Usage : py corrige.py "mon_fichier.ass"')
+        print('Usage : py corrige_qc_humain.py "mon_fichier.ass"')
         return
 
     input_path = Path(sys.argv[1])
-
     if not input_path.exists():
         print(f"Fichier introuvable : {input_path}")
         return
 
-    output_path = input_path.with_name(input_path.stem + "_corrige.ass")
-    backup_path = input_path.with_name(input_path.stem + "_backup.ass")
-
     original_text = input_path.read_text(encoding="utf-8-sig")
+    backup_path = input_path.with_name(input_path.stem + "_backup.ass")
+    output_path = input_path.with_name(input_path.stem + "_qc_humain.ass")
+
     backup_path.write_text(original_text, encoding="utf-8")
 
     lines = original_text.splitlines()
-    out = []
 
-    total = 0
     changed = 0
+    comments = 0
     kept = 0
 
-    for line in lines:
-        parsed = parse_dialogue(line)
-
-        if not parsed:
-            out.append(line + "\n")
+    for idx, line in enumerate(lines):
+        parts = parse_dialogue_line(line)
+        if not parts:
             continue
 
-        prefix, text = parsed
-        total += 1
+        text = parts[9]
+        corrected, suggestion, reason = process_line(text)
 
-        if not text.strip():
-            out.append(line + "\n")
+        if corrected != text:
+            changed += 1
+            print(f"[CORRECT] {text} -> {corrected}")
+            if reason:
+                print(f"  Raison : {reason}")
+        else:
             kept += 1
-            continue
+            print(f"[KEEP] {text}")
 
-        try:
-            prefixed = pre_fix(text)
-            prefixed = fix_infinitive_past(prefixed)
+        parts[9] = corrected
+        lines[idx] = ",".join(parts)
 
-            full_result = correct_text(prefixed)
-            full_result = fix_newlines(full_result)
-            full_result = post_fix(full_result)
+        if suggestion:
+            comment_line = make_comment_line(parts, suggestion, reason)
+            lines.insert(idx + 1, comment_line)
+            comments += 1
+            print(f"[QC] {corrected} || {suggestion}")
 
-            if looks_bad(full_result):
-                print(f"[SKIP assistant] {text}  ->  {full_result}")
-                out.append(",".join(prefix) + "," + text + "\n")
-                kept += 1
-                continue
-
-            if suspicious_output(full_result):
-                print(f"[SKIP suspect] {text}  ->  {full_result}")
-                out.append(",".join(prefix) + "," + text + "\n")
-                kept += 1
-                continue
-
-            base, suggestion = split_suggestion(full_result)
-
-            if forbidden_output(base):
-                print(f"[SKIP reformulation] {text}  ->  {base}")
-                out.append(",".join(prefix) + "," + text + "\n")
-                kept += 1
-                continue
-
-            if base.count("\\N") != prefixed.count("\\N"):
-                print(f"[SKIP \\N] {text}  ->  {base}")
-                out.append(",".join(prefix) + "," + text + "\n")
-                kept += 1
-                continue
-
-            if tags_broken(prefixed, base):
-                print(f"[SKIP tags] {text}  ->  {base}")
-                out.append(",".join(prefix) + "," + text + "\n")
-                kept += 1
-                continue
-
-            if tense_shift_suspect(prefixed, base):
-                print(f"[SKIP temps] {text}  ->  {base}")
-                out.append(",".join(prefix) + "," + text + "\n")
-                kept += 1
-                continue
-
-            if too_different(prefixed, base):
-                print(f"[SKIP trop différent] {text}  ->  {base}")
-                out.append(",".join(prefix) + "," + text + "\n")
-                kept += 1
-                continue
-
-            final_text = base
-            if suggestion_looks_ok(base, suggestion):
-                print(f"[SUGG] {base}  ||  {suggestion}")
-
-            out.append(",".join(prefix) + "," + final_text + "\n")
-
-            if final_text != text:
-                changed += 1
-                print(f"[OK] {text}  ->  {final_text}")
-            else:
-                kept += 1
-
-        except Exception as e:
-            print(f"[ERREUR] {text}  ->  {e}")
-            out.append(",".join(prefix) + "," + text + "\n")
-            kept += 1
-
-    output_path.write_text("".join(out), encoding="utf-8")
+    output_path.write_text("\n".join(lines), encoding="utf-8")
 
     print()
     print("Terminé.")
     print(f"Backup : {backup_path.name}")
     print(f"Sortie : {output_path.name}")
-    print(f"Lignes dialogue : {total}")
     print(f"Lignes modifiées : {changed}")
+    print(f"Lignes avec commentaire QC : {comments}")
     print(f"Lignes conservées : {kept}")
 
 if __name__ == "__main__":
